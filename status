@@ -1,0 +1,50 @@
+#! /usr/bin/env bash
+
+
+if [ "$(id -u)" -ne 0 ]; then
+  sudo "${0}" "${@}"
+  exit ${?}
+fi
+
+#==============================================================================
+
+parse() {
+  sed -nr "/^\[${2}\]/,/^\[/{/^${3}\s*=/{s/[^=]+\s*=\s*//; p; q;}}" "${1}"
+}
+
+#==============================================================================
+
+# declare -A ips_by_user
+declare -A user_by_pubkey
+
+# while read -r user_ip; do
+#   IFS=',' read -r user ip <<< "${user_ip}"
+#   ips_by_user+=([${user}]="${ip}")
+# done < /etc/wireguard/ipp.txt
+
+# for config in /etc/wireguard/configs/*; do
+#   user="$(basename "${config}" .conf)"
+#   parse "${config}" Interface Address
+# done
+
+for keyfile in /etc/wireguard/keys/*.pub; do
+  user="$(basename "${keyfile}" .pub)"
+  user_by_pubkey+=([$(<"${keyfile}")]="${user}")
+done
+
+#==============================================================================
+
+NAME=${1}
+USER=""
+
+p() {
+  [ ! -z "${NAME}" ] && [ "${USER}" != "${NAME}" ] && return
+  printf "${1}\n"
+}
+
+while read line; do
+  pubkey="$(echo "${line}" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2};?)?)?[mGK]//g" | grep -Po "peer: \K.*")" \
+    && { USER="${user_by_pubkey[${pubkey}]}"; p "[ \e[1;30m${USER}\e[0m ]"; }
+  p "${line}"
+done < <(WG_COLOR_MODE=always wg show wg0)
+

@@ -1,0 +1,27 @@
+#! /usr/bin/env bash
+
+if [ "$(id -u)" -ne 0 ]; then
+  sudo "${0}" "${@}"
+  exit ${?}
+fi
+
+script_root=$(cd "${BASH_SOURCE[0]%/*}" && pwd -P)
+
+usage() {
+  echo "Usage: $0 [CONFIG_NAME]"
+  echo
+  echo "List of configs:"
+  for config in /etc/wireguard/configs/*; do
+    basename "${config}" .conf | sed 's/^/  /'
+  done
+}
+[ ${#} -eq 1 ] || { echo "invalid arguments"; usage; exit 1; }
+
+wg set wg0 peer $(</etc/wireguard/keys/${1}.pub) remove
+rm /etc/wireguard/keys/${1}.{key,psk,pub}
+rm /etc/wireguard/configs/${1}.conf
+sed -i "/^${1}/d" /etc/wireguard/ipp.txt
+
+echo "removed ${1}"
+"${script_root}"/create-config server-config-update
+

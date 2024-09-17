@@ -1,0 +1,42 @@
+#! /usr/bin/env bash
+
+if [ "$(id -u)" -ne 0 ]; then
+  sudo "${0}" "${@}"
+  exit ${?}
+fi
+
+usage() { echo "Usage: $0 [CONFIG_NAME] [LIFETIME]"; }
+[ ${#} -eq 1 ] || [ ${#} -eq 2 ] || { echo "invalid arguments"; usage; exit 1; }
+
+script_root=$(cd "${BASH_SOURCE[0]%/*}" && pwd -P)
+
+#==============================================================================
+
+rng() { tr -cd '[:alnum:]' < /dev/urandom | head -c24; }
+
+#==============================================================================
+
+config="/etc/wireguard/configs/${1}.conf"
+
+[ -e "${config}" ] || { echo "no such config"; exit 1; }
+
+path="config-$(rng)"
+dst="/var/www/wireguard/${path}"
+url="https://katiska.cc/wireguard/${path}"
+
+cp -r "${script_root}/config-html-template" "${dst}"
+cp "${config}" "${dst}/wireguard.conf"
+qrencode -r "${config}" -t svg -o "${dst}/qr.svg"
+
+echo -e "\n[URL]"
+echo "${url}"
+
+echo -e "\n[DIRECT DL]"
+echo "sudo curl ${url}/wireguard.conf -o /etc/wireguard/wg0.conf"
+
+echo -e "\n[AUTOREMOVE]"
+cmd="rm -rf '${dst}'"
+echo "${cmd}" | at "now + ${2:-1 hour}" || {
+  echo "Invalid lifetime, defaulting to 15 minutes"
+  echo "${cmd}" | at "now + 15 minutes"
+}

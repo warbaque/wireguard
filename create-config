@@ -1,0 +1,186 @@
+#! /usr/bin/env bash
+
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  sudo "${0}" "${@}"
+  exit ${?}
+fi
+
+log() { echo -e "[INFO] ${@}" >&2; }
+usage() { echo "Usage: $0 [CONFIG_NAME]"; }
+[ ${#} -eq 1 ] || { echo "invalid arguments"; usage; exit 1; }
+
+RESET='\e[0m'
+CYAN='\e[1;36m'
+DARK_GRAY='\e[0;90m'
+color() { printf "${1}"; cat; printf "${RESET}"; }
+section() { printf "\n${CYAN}[ ${1} ]${RESET}\n"; } >&2
+
+#==============================================================================
+
+client-config-create() {
+mkdir -p /etc/wireguard/configs
+cat << EOF | tee "/etc/wireguard/configs/${NAME}.conf"
+[Interface]
+Address = ${IP}/32
+ListenPort = ${PORT}
+PrivateKey = $(</etc/wireguard/keys/"${NAME}.key")
+
+[Peer]
+PublicKey = $(</etc/wireguard/keys/"server.pub")
+PresharedKey = $(</etc/wireguard/keys/"${NAME}.psk")
+AllowedIPs = ${CIDR}
+Endpoint = ${ENDPOINT}
+EOF
+}
+
+server-config-interface() {
+cat << EOF
+[Interface]
+Address = $(IP_OFFSET=1 ip-range | head -1)/24
+SaveConfig = true
+ListenPort = ${PORT}
+PrivateKey = $(</etc/wireguard/keys/"server.key")
+EOF
+}
+
+server-config-peer() {
+cat << EOF
+[Peer]
+PublicKey = $(</etc/wireguard/keys/"${NAME}.pub")
+PresharedKey = $(</etc/wireguard/keys/"${NAME}.psk")
+AllowedIPs = ${IP}/32
+EOF
+}
+
+server-config-create() {
+  {
+    server-config-interface
+    while read -r user_ip; do
+      IFS=',' read -r NAME IP <<< "${user_ip}"
+      echo
+      server-config-peer
+    done < /etc/wireguard/ipp.txt
+  } | tee /etc/wireguard/wg0.conf
+}
+
+#==============================================================================
+
+keys-exist() { [ $(ls -1 "/etc/wireguard/keys/${1}".{key,pub,psk} 2>/dev/null | wc -l) -eq 3 ]; }
+
+keys-create() {
+  mkdir -p /etc/wireguard/keys
+  cd /etc/wireguard/keys
+  (umask 0077 && wg genkey | tee "${1}".key) | wg pubkey > "${1}".pub
+  (umask 0077 && wg genpsk > "${1}".psk)
+  log "Created keys for ${1}"
+}
+
+keys-check() {
+  keys-exist "${NAME}" \
+    && log "Using existing keys for ${NAME}" \
+    || keys-create "${NAME}"
+}
+
+ip-create() {
+  declare -A ips_by_user
+  declare -A ips_in_use
+  while read -r user_ip; do
+    IFS=',' read -r user ip <<< "${user_ip}"
+    ips_by_user+=([${user}]="${ip}")
+    ips_in_use+=([${ip}]=1)
+  done < /etc/wireguard/ipp.txt
+
+  if [ -n "${ips_by_user[${NAME}]:-}" ]; then
+    IP="${ips_by_user[${NAME}]}"
+    log "Using existing ip (${IP})"
+  else
+    IP=$(ip-range | while read ip; do [ -n "${ips_in_use[${ip}]:-}" ] || { echo ${ip}; break; }; done)
+    echo "${NAME},${IP}" >> /etc/wireguard/ipp.txt
+    log "Created ip ${IP} for ${NAME}"
+  fi
+}
+
+#=====[ ip helpers ] ==========================================================
+
+subnet-to-netmask() {
+  local bits=${1}
+  local netmask=()
+  for i in {0..3}; do
+    if   (( i < (bits/8) )); then netmask+=(0)
+    elif (( i > (bits/8) )); then netmask+=(255)
+    else netmask+=($((2**(8-bits%8)-1)))
+    fi
+  done
+  echo ${netmask[@]}
+}
+
+parse-cidr() {
+  local cidr=${1}
+  split=(${cidr//\// })
+  octets=(${split[0]//./ })
+  octets=($(for i in {0..3}; do echo ${octets[${i}]:-0}; done))
+  echo ${octets[*]} ${split[1]}
+}
+
+ip-range() {
+  local cidr=($(parse-cidr ${CIDR}))
+  local netmask=($(subnet-to-netmask ${cidr[-1]}))
+
+  addr_range_begin=($(for i in {0..3}; do echo $((${cidr[$i]} & ~${netmask[$i]})); done))
+  addr_range_end=($(for i in {0..3}; do echo $((${cidr[$i]} | ${netmask[$i]})); done))
+  ((addr_range_begin[3] += IP_OFFSET))
+
+  ips=($(for i in {0..3}; do echo "{${addr_range_begin[i]}..${addr_range_end[i]}}"; done))
+  for ip in $(IFS='.'; eval echo "${ips[*]}"); do
+    echo ${ip}
+  done
+}
+
+#==============================================================================
+
+server() {
+  keys-check
+  section "SERVER CONFIG"
+  server-config-create | color "${DARK_GRAY}" >&2
+  log "server config created"
+}
+
+server-config-update() {
+  server-config-create >/dev/null
+  log "server config updated"
+}
+
+client() {
+  keys-check
+  ip-create
+  section "CLIENT CONFIG"
+  client-config-create | color "${DARK_GRAY}" >&2
+  log "client config created"
+  section "SERVER CONFIG"
+  server-config-peer | color "${DARK_GRAY}" >&2
+
+  wg set wg0 \
+    peer $(</etc/wireguard/keys/"${NAME}.pub") \
+    preshared-key /etc/wireguard/keys/"${NAME}.psk" \
+    allowed-ips ${IP}/32
+
+  server-config-update
+
+  section "QR"
+  qrencode -t ansiutf8 < "/etc/wireguard/configs/${NAME}.conf"
+}
+
+#==============================================================================
+
+NAME=${1}
+CIDR=10.20.0.0/24
+PORT=51820
+ENDPOINT=vpn.katiska.dy.fi:51820
+IP_OFFSET=10
+
+case ${1} in
+  server|server-config-update) "${1}" ;;
+  *) client ;;
+esac
